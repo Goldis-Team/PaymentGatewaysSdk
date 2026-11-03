@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "payment-gateways-sdk"
-version = "0.2.0"
+version = "0.2.1"
 description = "A unified SDK for payment gateways with both sync and async engines."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -47,7 +47,7 @@ dependencies = [
 sadad = ["pycryptodome>=3.20"]
 # Parsian is the only SOAP gateway. zeep's `async` extra supplies the async transport that
 # ParsianAsync awaits; it pulls in httpx, which is zeep's own async client.
-parsian = ["zeep[async]>=4.2"]
+parsian = ["zeep[async]>=4.2", "httpx>=0.27"]
 card = ["pycryptodome>=3.20"]
 # SOCKS proxies (Parsian's optional `proxy` credential) need a SOCKS-capable client on both
 # engines. Plain http:// and https:// proxies work without this.

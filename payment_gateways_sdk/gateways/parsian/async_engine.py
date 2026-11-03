@@ -24,6 +24,7 @@ from payment_gateways_sdk.gateways.parsian.helpers import (
     callback_declined,
     parse_confirm_result,
     parse_sale_result,
+    wsdl_document,
 )
 
 
@@ -34,12 +35,14 @@ class ParsianAsync:
         self.config = ParsianConfig(pin=pin, proxy=proxy)
 
     def warm_up(self) -> None:
-        async_client(self.config, SALE_WSDL)
-        async_client(self.config, CONFIRM_WSDL)
+        """Preload WSDLs synchronously; async payment calls also load them safely on demand."""
+        wsdl_document(self.config, SALE_WSDL)
+        wsdl_document(self.config, CONFIRM_WSDL)
 
     async def _call(self, wsdl: str, operation: str, request_data: dict[str, Any]) -> Any:
-        client = async_client(self.config, wsdl)
-        return await getattr(client.service, operation)(requestData=request_data)
+        client = await async_client(self.config, wsdl)
+        result = await getattr(client.service, operation)(requestData=request_data)
+        return result
 
     async def make_payment_request(self, data: PaymentRequest) -> PaymentResponse:
         request_data = build_sale_request(self.config, data)

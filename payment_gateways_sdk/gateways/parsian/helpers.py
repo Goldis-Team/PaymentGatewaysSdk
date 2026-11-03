@@ -1,6 +1,10 @@
+import asyncio
 import base64
 import json
+import ssl
+import threading
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from payment_gateways_sdk.common.data import (
     CardPaymentRequest,
@@ -35,7 +39,11 @@ from payment_gateways_sdk.gateways.parsian.data import (
 )
 
 _sync_clients: dict[tuple[str, str], Any] = {}
-_async_clients: dict[tuple[str, str], Any] = {}
+_async_clients: WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[str, str], Any]] = (
+    WeakKeyDictionary()
+)
+_wsdl_documents: dict[tuple[str, str], tuple[Any, ssl.SSLContext]] = {}
+_wsdl_lock = threading.Lock()
 
 
 def _require_zeep() -> Any:
@@ -70,13 +78,40 @@ def sync_client(config: ParsianConfig, wsdl: str) -> Any:
     return client
 
 
-def async_client(config: ParsianConfig, wsdl: str) -> Any:
+def wsdl_document(config: ParsianConfig, wsdl: str) -> tuple[Any, ssl.SSLContext]:
+    """Load imported WSDL/XSD documents once; called off the loop by the async engine."""
+    key = (wsdl, config.proxy.strip())
+    # Concurrent cold callers and a cancelled waiter must not duplicate or publish partial loads.
+    with _wsdl_lock:
+        cached = _wsdl_documents.get(key)
+        if cached is None:
+            zeep = _require_zeep()
+            import requests  # noqa: PLC0415 — the WSDL loader is deliberately synchronous
+
+            with requests.Session() as session:
+                if key[1]:
+                    session.proxies = {"http": key[1], "https": key[1]}
+                transport = zeep.transports.Transport(session=session)
+                document = zeep.wsdl.Document(wsdl, transport)
+            # httpx otherwise reads CA files synchronously when constructing its clients.
+            cached = (document, ssl.create_default_context())
+            _wsdl_documents[key] = cached
+    return cached
+
+
+async def async_client(config: ParsianConfig, wsdl: str) -> Any:
     proxy = config.proxy.strip()
     key = (wsdl, proxy)
-    cached = _async_clients.get(key)
+    clients = _async_clients.setdefault(asyncio.get_running_loop(), {})
+    cached = clients.get(key)
     if cached is not None:
         return cached
 
+    document, ssl_context = await asyncio.to_thread(wsdl_document, config, wsdl)
+    # Another caller may have installed the loop's client while this one awaited the document.
+    cached = clients.get(key)
+    if cached is not None:
+        return cached
     zeep = _require_zeep()
     try:
         from zeep.transports import AsyncTransport  # noqa: PLC0415 — part of the `async` extra
@@ -86,20 +121,33 @@ def async_client(config: ParsianConfig, wsdl: str) -> Any:
             "install it with: pip install 'payment-gateways-sdk[parsian]'"
         ) from exc
 
-    transport: Any = None
-    if proxy:
-        import httpx  # noqa: PLC0415 — zeep's async transport is built on httpx
+    import httpx  # noqa: PLC0415 — only the optional SOAP engine needs httpx
 
-        transport = AsyncTransport(client=httpx.AsyncClient(proxy=proxy))
-    client = zeep.AsyncClient(wsdl, transport=transport) if transport else zeep.AsyncClient(wsdl)
-    _async_clients[key] = client
+    transport = AsyncTransport(
+        client=httpx.AsyncClient(
+            verify=ssl_context, proxy=proxy or None, timeout=5.0 if proxy else None
+        ),
+        wsdl_client=httpx.Client(verify=ssl_context, proxy=proxy or None),
+    )
+    client = zeep.AsyncClient(document, transport=transport)
+    clients[key] = client
     return client
+
+
+async def close_async_clients() -> None:
+    """Close this event loop's cached SOAP transports during application shutdown."""
+    clients = _async_clients.pop(asyncio.get_running_loop(), {})
+    for client in clients.values():
+        await client.transport.aclose()
+        client.transport.wsdl_client.close()
 
 
 def clear_client_cache() -> None:
     """Drop every cached client. Used by the tests, which point each case at a fresh WSDL."""
     _sync_clients.clear()
     _async_clients.clear()
+    with _wsdl_lock:
+        _wsdl_documents.clear()
 
 
 def redirect_url(token: int) -> str:

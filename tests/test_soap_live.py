@@ -1,8 +1,9 @@
 import asyncio
+import base64
 import re
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -10,12 +11,16 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from payment_gateways_sdk import (
+    CardPaymentRequest,
     ConfigurationError,
     GatewayError,
     ParsianAsync,
+    ParsianCardAsync,
     ParsianSync,
     PaymentRequest,
+    PaymentResponse,
     PaymentVerification,
+    VerificationResult,
 )
 from payment_gateways_sdk.gateways.parsian import ParsianConfirmDetails, ParsianSaleDetails
 from payment_gateways_sdk.gateways.parsian import async_engine as parsian_async
@@ -47,6 +52,9 @@ class Recorder:
         self.confirm_rrn = "987654321"
         self.mode = "ok"  # "ok" | "fault"
         self.delay = 0.0
+        self.wsdl_delay = 0.0
+        self.wsdl_status = 200
+        self.wsdl_started = threading.Event()
         self.lock = threading.Lock()
 
 
@@ -68,8 +76,14 @@ def _make_handler(rec: Recorder) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:
             """Serve the WSDL. This is the request zeep makes before it can do anything."""
+            rec.wsdl_started.set()
+            if rec.wsdl_delay:
+                time.sleep(rec.wsdl_delay)
             with rec.lock:
                 rec.wsdl_fetches += 1
+            if rec.wsdl_status != 200:
+                self._send("WSDL unavailable", status=rec.wsdl_status)
+                return
             if self.path.startswith(SALE_PATH):
                 self._send(sale_wsdl(f"{self.base_url}{SALE_PATH}"))
             elif self.path.startswith(CONFIRM_PATH):
@@ -166,7 +180,7 @@ def _make_handler(rec: Recorder) -> type[BaseHTTPRequestHandler]:
 
 
 @pytest.fixture
-def pec(monkeypatch: pytest.MonkeyPatch) -> Iterator[Recorder]:
+async def pec(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Recorder]:
     """A real PEC-shaped server serving real WSDLs, with both engines pointed at it."""
     recorder = Recorder()
     handler = _make_handler(recorder)
@@ -185,6 +199,7 @@ def pec(monkeypatch: pytest.MonkeyPatch) -> Iterator[Recorder]:
     try:
         yield recorder
     finally:
+        await parsian_helpers.close_async_clients()
         parsian_helpers.clear_client_cache()
         server.shutdown()
         server.server_close()
@@ -295,6 +310,100 @@ async def test_full_payment_cycle_async(pec: Recorder) -> None:
     assert verified.success
     assert verified.amount == AMOUNT
     assert [r["operation"] for r in pec.requests] == ["SalePaymentRequest", "ConfirmPayment"]
+
+
+@pytest.mark.parametrize("operation", ["sale", "confirm", "card"])
+async def test_cold_wsdl_does_not_block_other_requests(pec: Recorder, operation: str) -> None:
+    pec.wsdl_delay = 0.4
+    payment: asyncio.Task[PaymentResponse | VerificationResult]
+    if operation == "confirm":
+        payment = asyncio.create_task(ParsianAsync(pin=PIN).verify_payment(a_verification()))
+    elif operation == "card":
+        gateway = ParsianCardAsync(
+            pin=PIN,
+            aes_key=base64.b64encode(b"k" * 16).decode(),
+            aes_iv=base64.b64encode(b"i" * 16).decode(),
+        )
+        payment = asyncio.create_task(
+            gateway.make_card_payment_request(
+                CardPaymentRequest(
+                    amount=AMOUNT,
+                    callback_url=CALLBACK,
+                    order_id=ORDER_ID,
+                    card_pan="6221061234567890",
+                )
+            )
+        )
+    else:
+        payment = asyncio.create_task(ParsianAsync(pin=PIN).make_payment_request(a_request()))
+    delays = []
+    while not payment.done():
+        started = time.monotonic()
+        await asyncio.sleep(0.005)
+        delays.append(time.monotonic() - started - 0.005)
+    result = payment.result()
+    assert result
+    assert len(pec.requests) == 1
+    assert max(delays) < 0.15, f"cold {operation} WSDL blocked requests for {max(delays):.3f}s"
+
+
+async def test_concurrent_cold_payments_load_one_wsdl(pec: Recorder) -> None:
+    pec.wsdl_delay = 0.1
+    payments = await asyncio.gather(
+        *(
+            ParsianAsync(pin=PIN).make_payment_request(a_request(order_id=str(6000 + i)))
+            for i in range(8)
+        )
+    )
+    assert len(payments) == len(pec.requests) == 8
+    assert pec.wsdl_fetches == 1
+
+
+async def test_cancelled_wsdl_waiter_never_sends_a_payment(pec: Recorder) -> None:
+    pec.wsdl_delay = 0.2
+    gateway = ParsianAsync(pin=PIN)
+    cancelled = asyncio.create_task(gateway.make_payment_request(a_request()))
+    assert await asyncio.to_thread(pec.wsdl_started.wait, 2)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    payment = await gateway.make_payment_request(a_request(order_id="7001"))
+    assert payment.authority == "90100200"
+    assert pec.wsdl_fetches == 1
+    assert len(pec.requests) == 1
+    assert pec.requests[0]["fields"]["OrderId"] == "7001"
+
+
+async def test_failed_wsdl_load_can_be_retried(pec: Recorder) -> None:
+    pec.wsdl_status = 503
+    gateway = ParsianAsync(pin=PIN)
+    with pytest.raises(GatewayError):
+        await gateway.make_payment_request(a_request())
+    assert not pec.requests
+    pec.wsdl_status = 200
+    payment = await gateway.make_payment_request(a_request())
+    assert payment.authority == "90100200"
+    assert pec.wsdl_fetches == 2
+    assert len(pec.requests) == 1
+
+
+async def test_wsdl_cache_does_not_share_http_clients_between_loops(pec: Recorder) -> None:
+    gateway = ParsianAsync(pin=PIN)
+    first = await gateway.make_payment_request(a_request())
+
+    async def second_loop() -> str:
+        try:
+            second = await gateway.make_payment_request(a_request(order_id="8001"))
+            return second.authority
+        finally:
+            await parsian_helpers.close_async_clients()
+
+    def run_second_loop() -> str:
+        return asyncio.run(second_loop())
+
+    assert await asyncio.to_thread(run_second_loop) == first.authority
+    assert len(pec.requests) == 2
+    assert pec.wsdl_fetches == 1
 
 
 async def test_concurrent_soap_calls_do_not_serialise(pec: Recorder) -> None:

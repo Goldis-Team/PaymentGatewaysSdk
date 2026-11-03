@@ -12,6 +12,7 @@ from payment_gateways_sdk.gateways.parsian.data import (
     ParsianConfirmDetails as ParsianConfirmDetails,
 )
 from payment_gateways_sdk.gateways.parsian.data import ParsianSaleDetails as ParsianSaleDetails
+from payment_gateways_sdk.gateways.parsian.helpers import close_async_clients as close_async_clients
 from payment_gateways_sdk.gateways.parsian.sync_engine import (
     ParsianCardSync as ParsianCardSync,
 )

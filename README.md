@@ -110,7 +110,7 @@ Every gateway also takes `timeout=15.0`, except Parsian.
 
 **Verifies amount** — where the gateway reports a settled amount, it is compared to the amount the payment was opened for and a mismatch fails. Where it reports none, what binds the answer to the payment is that the call is scoped to a token the SDK issued. ZarinPal checks the amount at its end: it is part of the verify *request*, so a transaction settled for anything else comes back as an error rather than as success.
 
-**Parsian** talks SOAP through `zeep`, which reads a WSDL before its first call. That is cached per process, so it costs the first payment and nothing after — call `ParsianAsync(pin=...).warm_up()` during application startup to pay it before any customer is waiting.
+**Parsian** talks SOAP through `zeep`. From version 0.2.1, the async engine loads and parses its WSDL/XSD documents outside the event loop, including the first payment or confirmation. Concurrent cold callers share the document cache; SOAP clients and their connection pools belong to the calling event loop. The existing synchronous `warm_up()` remains available for synchronous startup code; async callers need no warm-up. During async application shutdown, call `await payment_gateways_sdk.gateways.parsian.close_async_clients()` to close that loop's cached transports.
 
 ## Credentials
 
