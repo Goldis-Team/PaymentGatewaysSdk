@@ -1,0 +1,33 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  package-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install this project and its test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --group test -e ".[all]" build
+          python -m pip check
+      - name: Run offline contracts and behavior tests
+        run: python -m pytest tests -m "not integration"
+      - name: Build the native wheel and source distribution
+        run: python -m build
